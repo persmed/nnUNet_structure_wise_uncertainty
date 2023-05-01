@@ -447,3 +447,16 @@ class Generic_UNet(SegmentationNetwork):
                 tmp += np.prod(map_size, dtype=np.int64) * num_classes
             # print(p, map_size, num_feat, tmp)
         return tmp
+
+    @staticmethod
+    def apply_dropout_layers(m):
+        if isinstance(m, (nn.Dropout2d, nn.Dropout3d)):
+            m.train()
+            #print('      ',m,'activate dropout with ', m.p)
+
+    @staticmethod
+    def activate_dropout(m):
+        if isinstance(m,ConvDropoutNormNonlin):
+            #print(type(m))
+            m.apply(Generic_UNet.apply_dropout_layers)
+

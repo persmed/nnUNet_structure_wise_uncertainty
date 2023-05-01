@@ -45,12 +45,15 @@ class nnUNetTrainerV2(nnUNetTrainer):
                  unpack_data=True, deterministic=True, fp16=False):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
-        self.max_num_epochs = 1000
+        self.max_num_epochs = 60
         self.initial_lr = 1e-2
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
 
         self.pin_memory = True
+
+        self.dropout_in_localization = False
+        self.dropout_op_kwargs = {'p': 0, 'inplace': True}
 
     def initialize(self, training=True, force_load_plans=False):
         """
@@ -148,14 +151,14 @@ class nnUNetTrainerV2(nnUNetTrainer):
             norm_op = nn.InstanceNorm2d
 
         norm_op_kwargs = {'eps': 1e-5, 'affine': True}
-        dropout_op_kwargs = {'p': 0, 'inplace': True}
+
         net_nonlin = nn.LeakyReLU
         net_nonlin_kwargs = {'negative_slope': 1e-2, 'inplace': True}
         self.network = Generic_UNet(self.num_input_channels, self.base_num_features, self.num_classes,
                                     len(self.net_num_pool_op_kernel_sizes),
                                     self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
-                                    dropout_op_kwargs,
-                                    net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
+                                    self.dropout_op_kwargs,
+                                    net_nonlin, net_nonlin_kwargs, True, self.dropout_in_localization, lambda x: x, InitWeights_He(1e-2),
                                     self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
         if torch.cuda.is_available():
             self.network.cuda()
@@ -202,7 +205,7 @@ class nnUNetTrainerV2(nnUNetTrainer):
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
                                                          pad_kwargs: dict = None, all_in_gpu: bool = False,
-                                                         verbose: bool = True, mixed_precision=True) -> Tuple[np.ndarray, np.ndarray]:
+                                                         verbose: bool = True, mixed_precision=True, ttd=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         We need to wrap this because we need to enforce self.network.do_ds = False for prediction
         """
@@ -216,7 +219,7 @@ class nnUNetTrainerV2(nnUNetTrainer):
                                                                        pad_border_mode=pad_border_mode,
                                                                        pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu,
                                                                        verbose=verbose,
-                                                                       mixed_precision=mixed_precision)
+                                                                       mixed_precision=mixed_precision, ttd=ttd)
         self.network.do_ds = ds
         return ret
 

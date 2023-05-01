@@ -122,6 +122,14 @@ def main():
                         help='Predictions are done with mixed precision by default. This improves speed and reduces '
                              'the required vram. If you want to disable mixed precision you can set this flag. Note '
                              'that this is not recommended (mixed precision is ~2x faster!)')
+    parser.add_argument('-ttdp', type=float, default=0.1, required=False,
+                        help='Test time dropout probability. Default 0.1')
+    parser.add_argument('-ttdl', default=False, action='store_true', required=False,
+                        help='Activate for test time dropout by default the dropout layers in the localization path')
+    parser.add_argument('-ttdn', type=int, default=0, required=False,
+                        help='Number of iteration with activated dropout during test time. x times folds. Total '
+                             'prediction is (1+x) * number of folds. If ttdn > 0 and ttdp = 0 the original folds are'
+                             'saved')
 
     args = parser.parse_args()
     input_folder = args.input_folder
@@ -220,7 +228,7 @@ def main():
                         num_threads_nifti_save, lowres_segmentations, part_id, num_parts, not disable_tta,
                         overwrite_existing=overwrite_existing, mode=mode, overwrite_all_in_gpu=all_in_gpu,
                         mixed_precision=not args.disable_mixed_precision,
-                        step_size=step_size, checkpoint_name=args.chk)
+                        step_size=step_size, checkpoint_name=args.chk, ttdp=args.ttdp, ttdl=args.ttdl, ttdn=args.ttdn)
     end = time()
     save_json(end - st, join(output_folder, 'prediction_time.txt'))
 

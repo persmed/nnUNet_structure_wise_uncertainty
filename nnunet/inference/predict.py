@@ -30,6 +30,7 @@ from nnunet.postprocessing.connected_components import load_remove_save, load_po
 from nnunet.training.model_restore import load_model_and_checkpoint_files
 from nnunet.training.network_training.nnUNetTrainer import nnUNetTrainer
 from nnunet.utilities.one_hot_encoding import to_one_hot
+import medpy.metric as metric
 
 
 def preprocess_save_to_queue(preprocess_fn, q, list_of_lists, output_files, segs_from_prev_stage, classes,
@@ -132,7 +133,8 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
                   num_threads_nifti_save, segs_from_prev_stage=None, do_tta=True, mixed_precision=True,
                   overwrite_existing=False,
                   all_in_gpu=False, step_size=0.5, checkpoint_name="model_final_checkpoint",
-                  segmentation_export_kwargs: dict = None, disable_postprocessing: bool = False):
+                  segmentation_export_kwargs: dict = None, disable_postprocessing: bool = False, ttdp = 0.1,
+                  ttdl = False, ttdn = 0):
     """
     :param segmentation_export_kwargs:
     :param model: folder where the model is saved, must contain fold_x subfolders
@@ -183,6 +185,12 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
     print("loading parameters for folds,", folds)
     trainer, params = load_model_and_checkpoint_files(model, folds, mixed_precision=mixed_precision,
                                                       checkpoint_name=checkpoint_name)
+    print('Test time dropout settings: ', ttdp, ttdl, ttdn)
+    if ttdp > 0 and ttdn > 0:
+        trainer.was_initialized = False
+        trainer.dropout_in_localization = ttdl
+        trainer.dropout_op_kwargs = {'p': ttdp, 'inplace': True}
+        trainer.initialize(False)
 
     if segmentation_export_kwargs is None:
         if 'segmentation_export_params' in trainer.plans.keys():
@@ -203,7 +211,9 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
                                              segs_from_prev_stage)
     print("starting prediction...")
     all_output_files = []
+    mc_filenames = []
     for preprocessed in preprocessing:
+        softmax_list = []
         output_filename, (d, dct) = preprocessed
         all_output_files.append(all_output_files)
         if isinstance(d, str):
@@ -213,20 +223,25 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
 
         print("predicting", output_filename)
         trainer.load_checkpoint_ram(params[0], False)
-        softmax = trainer.predict_preprocessed_data_return_seg_and_softmax(
+        softmax_list.append(trainer.predict_preprocessed_data_return_seg_and_softmax(
             d, do_mirroring=do_tta, mirror_axes=trainer.data_aug_params['mirror_axes'], use_sliding_window=True,
             step_size=step_size, use_gaussian=True, all_in_gpu=all_in_gpu,
-            mixed_precision=mixed_precision)[1]
+            mixed_precision=mixed_precision)[1])
 
         for p in params[1:]:
             trainer.load_checkpoint_ram(p, False)
-            softmax += trainer.predict_preprocessed_data_return_seg_and_softmax(
+            softmax_list.append(trainer.predict_preprocessed_data_return_seg_and_softmax(
                 d, do_mirroring=do_tta, mirror_axes=trainer.data_aug_params['mirror_axes'], use_sliding_window=True,
                 step_size=step_size, use_gaussian=True, all_in_gpu=all_in_gpu,
-                mixed_precision=mixed_precision)[1]
+                mixed_precision=mixed_precision)[1])
 
+        softmax = np.copy(softmax_list[0])
         if len(params) > 1:
+            for i in range(1, len(params)):
+                softmax += softmax_list[i]
             softmax /= len(params)
+
+        nb_label = len(softmax)-1
 
         transpose_forward = trainer.plans.get('transpose_forward')
         if transpose_forward is not None:
@@ -267,6 +282,36 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
                                             None, None,
                                             npz_file, None, force_separate_z, interpolation_order_z),)
                                           ))
+        if ttdp > 0:  #Only generate additional prediction if dropout is active, and they would vary
+            for n in range(0, ttdn):
+                print("Predicting MC iteration: ", n + 1, output_filename)
+                trainer.load_checkpoint_ram(params[0], False)
+                softmax_list.append(trainer.predict_preprocessed_data_return_seg_and_softmax(
+                    d, do_mirroring=do_tta, mirror_axes=trainer.data_aug_params['mirror_axes'], use_sliding_window=True,
+                    step_size=step_size, use_gaussian=True, all_in_gpu=all_in_gpu,
+                    mixed_precision=mixed_precision, ttd=True)[1])
+
+                for p in params[1:]:
+                    trainer.load_checkpoint_ram(p, False)
+                    softmax_list.append(trainer.predict_preprocessed_data_return_seg_and_softmax(
+                        d, do_mirroring=do_tta, mirror_axes=trainer.data_aug_params['mirror_axes'], use_sliding_window=True,
+                        step_size=step_size, use_gaussian=True, all_in_gpu=all_in_gpu,
+                        mixed_precision=mixed_precision, ttd=True)[1])
+
+        if ttdn > 0:  # Save all the individual predictions when ttdn is activated
+            mc_case = []
+            for i, softmax in enumerate(softmax_list):
+                mc_filename = output_filename[:-7] + '_MC_' + '{:02d}'.format(i) + '.nii.gz'
+                mc_case.append(mc_filename)
+                if transpose_forward is not None:
+                    transpose_backward = trainer.plans.get('transpose_backward')
+                    softmax = softmax.transpose([0] + [i + 1 for i in transpose_backward])
+                results.append(pool.starmap_async(save_segmentation_nifti_from_softmax,
+                                                  ((softmax, mc_filename, dct, interpolation_order, region_class_order,
+                                                    None, None,
+                                                    npz_file, None, force_separate_z, interpolation_order_z),)
+                                                  ))
+            mc_filenames.append(mc_case)
 
     print("inference done. Now waiting for the segmentation export to finish...")
     _ = [i.get() for i in results]
@@ -276,6 +321,9 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
         results = []
         pp_file = join(model, "postprocessing.json")
         if isfile(pp_file):
+            #copy non postprocessed segmentation
+            for file in output_filenames:
+                shutil.copy(file,file[:-7] + '_no_pp.nii.gz')
             print("postprocessing...")
             shutil.copy(pp_file, os.path.abspath(os.path.dirname(output_filenames[0])))
             # for_which_classes stores for which of the classes everything but the largest connected component needs to be
@@ -285,6 +333,19 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
                                               zip(output_filenames, output_filenames,
                                                   [for_which_classes] * len(output_filenames),
                                                   [min_valid_obj_size] * len(output_filenames))))
+
+            for name_list in mc_filenames:
+                # join non post processed mc segmentation
+                sitk_files = [sitk.ReadImage(file) for file in name_list]
+                img = sitk.JoinSeries(sitk_files)
+                sitk.WriteImage(img, name_list[0][:-13] + '_MC_no_pp.nii.gz')
+
+                print("postprocessing...MC")
+                results.append(pool.starmap_async(load_remove_save,
+                                                  zip(name_list, name_list,
+                                                      [for_which_classes] * len(name_list),
+                                                      [min_valid_obj_size] * len(name_list))))
+
             _ = [i.get() for i in results]
         else:
             print("WARNING! Cannot run postprocessing because the postprocessing file is missing. Make sure to run "
@@ -294,6 +355,85 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
     pool.close()
     pool.join()
 
+    if ttdn > 0:
+        # join post processed mc segmentation and cleanup
+        for name_list in mc_filenames:
+            sitk_files = [sitk.ReadImage(file) for file in name_list]
+            img = sitk.JoinSeries(sitk_files)
+            sitk.WriteImage(img, name_list[0][:-13] + '_MC.nii.gz')
+            for file in name_list:
+                os.remove(file)
+
+    if(len(mc_filenames) > 0):
+        estimate_dice(mc_filenames, nb_label, len(params), ttdp, ttdl, do_tta, disable_postprocessing, model)
+
+def estimate_dice(mc_files, nb_label, nb_folds, ttdp, ttdl, do_tta, disable_postprocessing, model):
+    output_folder = os.path.dirname(mc_files[0][0])
+    json_file = os.path.join(output_folder,'dice_estimation.json')
+    try:
+        with open(json_file, 'r') as f:
+            data = json.load(f)
+            results = data['results']
+    except Exception:
+        data = {}
+        results = []
+
+    for file in mc_files:
+        if not disable_postprocessing:
+            prediction_name = file[0][:-13] + '_no_pp.nii.gz'
+            mc_name = file[0][:-13] +  '_MC_no_pp.nii.gz'
+        else:
+            prediction_name = file[0][:-13] + '.nii.gz'
+            mc_name = file[0][:-13] +  '_MC.nii.gz'
+        mc_image = sitk.GetArrayFromImage(sitk.ReadImage(mc_name))
+        prediction = sitk.GetArrayFromImage(sitk.ReadImage(prediction_name))
+        number_predictions = len(mc_image)
+        labels = range(1,nb_label+1)
+        result = {}
+        for label in labels:
+            pred = prediction == label
+            if number_predictions > nb_folds:
+                image_n = mc_image[nb_folds:] == label
+            else:
+                image_n = mc_image[:nb_folds] == label
+            print(len(image_n))
+            # calculate IoP and variation of it
+            IoU = np.count_nonzero(np.all(image_n, axis=0))\
+                        /(np.count_nonzero(np.any(image_n, axis=0))+np.finfo(float).eps)
+            IoP = np.count_nonzero(np.all(image_n, axis=0))\
+                        /(np.count_nonzero(pred)+np.finfo(float).eps)
+            PoU = np.count_nonzero(pred)\
+                        /(np.count_nonzero(np.any(image_n, axis=0))+np.finfo(float).eps)
+
+            v = [] #calculate Coefficient of variation of the volume
+            for i in range(image_n.shape[0]):
+                v.append(np.count_nonzero(image_n[i]))
+            v = np.array(v)
+            CV = np.std(v)/(np.mean(v)+np.finfo(float).eps)
+
+            dc = [] #calculate average and median Dice
+            for i in range(image_n.shape[0]):
+                dc.append(metric.dc(image_n[i],pred))
+            dc = np.array(dc)
+            DCA = np.mean(dc)
+            DCM = np.median(dc)
+
+            result[label] = {'IoU': IoU, 'IoP': IoP, 'PoU': PoU, 'CV': CV, 'DCA': DCA, 'DCM': DCM,\
+                             'DIU': 2 * IoU / (IoU + 1), 'DIP': 2 * IoP / (IoP + 1), 'DPU': 2 * PoU / (PoU + 1)}
+
+        result['test'] = prediction_name
+        results.append(result)
+
+    data['number_of_samples'] = len(image_n)
+    data['test_time_dropout_probability'] = ttdp
+    data['test_time_dropout_in_the_decoder'] = ttdl
+    data['test_time_augmentation'] = do_tta
+    data['postprocessing_disabled'] = disable_postprocessing
+    data['model'] = model
+    data['results'] = results
+
+    with open(json_file, 'w') as f:
+        json.dump(data, f, indent=4, sort_keys=False)
 
 def predict_cases_fast(model, list_of_lists, output_filenames, folds, num_threads_preprocessing,
                        num_threads_nifti_save, segs_from_prev_stage=None, do_tta=True, mixed_precision=True,
@@ -610,7 +750,7 @@ def predict_from_folder(model: str, input_folder: str, output_folder: str, folds
                         part_id: int, num_parts: int, tta: bool, mixed_precision: bool = True,
                         overwrite_existing: bool = True, mode: str = 'normal', overwrite_all_in_gpu: bool = None,
                         step_size: float = 0.5, checkpoint_name: str = "model_final_checkpoint",
-                        segmentation_export_kwargs: dict = None, disable_postprocessing: bool = False):
+                        segmentation_export_kwargs: dict = None, disable_postprocessing: bool = False, ttdp = 0.1, ttdl = False, ttdn = 0):
     """
         here we use the standard naming scheme to generate list_of_lists and output_files needed by predict_cases
 
@@ -664,7 +804,7 @@ def predict_from_folder(model: str, input_folder: str, output_folder: str, folds
                              all_in_gpu=all_in_gpu,
                              step_size=step_size, checkpoint_name=checkpoint_name,
                              segmentation_export_kwargs=segmentation_export_kwargs,
-                             disable_postprocessing=disable_postprocessing)
+                             disable_postprocessing=disable_postprocessing, ttdp=ttdp, ttdl=ttdl, ttdn=ttdn)
     elif mode == "fast":
         if overwrite_all_in_gpu is None:
             all_in_gpu = False
@@ -767,6 +907,14 @@ if __name__ == "__main__":
                         help='Predictions are done with mixed precision by default. This improves speed and reduces '
                              'the required vram. If you want to disable mixed precision you can set this flag. Note '
                              'that this is not recommended (mixed precision is ~2x faster!)')
+    parser.add_argument('-ttdp', type=float, default=0.1, required=False,
+                        help='Test time dropout probability. Default 0.1')
+    parser.add_argument('-ttdl', default=False, action='store_true', required=False,
+                        help='Activate for test time dropout by default the dropout layers in the localization path')
+    parser.add_argument('-ttdn', type=int, default=0, required=False,
+                        help='Number of iteration with activated dropout during test time. x times folds. Total '
+                             'prediction is (1+x) * number of folds. If ttdn > 0 and ttdp = 0 the original folds are'
+                             'saved')
 
     args = parser.parse_args()
     input_folder = args.input_folder
@@ -837,4 +985,5 @@ if __name__ == "__main__":
     predict_from_folder(model, input_folder, output_folder, folds, save_npz, num_threads_preprocessing,
                         num_threads_nifti_save, lowres_segmentations, part_id, num_parts, tta,
                         mixed_precision=not args.disable_mixed_precision,
-                        overwrite_existing=overwrite, mode=mode, overwrite_all_in_gpu=all_in_gpu, step_size=step_size)
+                        overwrite_existing=overwrite, mode=mode, overwrite_all_in_gpu=all_in_gpu, step_size=step_size,
+                        ttdp=ttdp, ttdl=ttdl, ttdn=ttdn)
